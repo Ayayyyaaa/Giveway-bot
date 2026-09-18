@@ -8,6 +8,9 @@ bottom of the conversation), then the counter is reset to 0.
 import asyncio
 import logging
 import os
+import random
+import re
+import time
 from typing import Optional
 
 import discord
@@ -15,7 +18,8 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from core.db import Database
+from db import Database
+
 
 load_dotenv()
 
@@ -25,7 +29,6 @@ log = logging.getLogger("sticky-bot")
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
 DATA_DIR = os.getenv("DATA_DIR", "/data")
-DB_PATH = os.path.join(DATA_DIR, "sticky.db")
 DEFAULT_THRESHOLD = int(os.getenv("DEFAULT_THRESHOLD", "1"))
 
 INTENTS = discord.Intents.default()
@@ -56,16 +59,13 @@ def build_presence(status_key: str, activity_type_key: str, activity_text: str):
     return status_obj, activity_obj
 
 
-class StickyBot(commands.Bot):
+class GivewayBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=INTENTS)
-        self.db: Optional[Database] = None
+        self.db = Database()
 
     async def setup_hook(self):
-        os.makedirs(DATA_DIR, exist_ok=True)
-        self.db = Database(DB_PATH)
         await self.db.connect()
-        log.info("Base de données prête (%s)", DB_PATH)
 
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
@@ -76,10 +76,6 @@ class StickyBot(commands.Bot):
             await self.tree.sync()
             log.info("Commandes synchronisées globalement (jusqu'à 1h pour apparaître partout)")
 
-    async def close(self):
-        if self.db:
-            await self.db.close()
-        await super().close()
 
     async def on_ready(self):
         log.info("Connecté en tant que %s (id: %s)", self.user, self.user.id)
@@ -100,132 +96,49 @@ class StickyBot(commands.Bot):
             await self.change_presence(status=status_obj, activity=activity_obj)
             log.info("Présence restaurée : %s / %s", presence["status"], presence["activity_text"])
 
+        await self.resume_giveaways()
 
-bot = StickyBot()
+    async def resume_giveaways(self):
+        """Reschedules giveaways that were still active before the bot restarted."""
+        rows = await self.db.get_active_giveaways()
+        for row in rows:
+            channel = self.get_channel(row["channel_id"])
+            if channel is None:
+                try:
+                    channel = await self.fetch_channel(row["channel_id"])
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    log.warning("Giveaway %s: channel %s unreachable, dropping it.", row["message_id"], row["channel_id"])
+                    await self.db.remove_giveaway(row["message_id"])
+                    continue
 
-LOG_SOURCE_CHANNEL_ID = 1533559386629472486
-LOG_TARGET_CHANNEL_ID = 1545497664894935181
+            try:
+                message = await channel.fetch_message(row["message_id"])
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                log.warning("Giveaway %s: message not found, dropping it.", row["message_id"])
+                await self.db.remove_giveaway(row["message_id"])
+                continue
 
+            try:
+                host = await self.fetch_user(row["host_id"])
+            except (discord.NotFound, discord.HTTPException):
+                host = message.author  # fallback: the bot itself
 
-async def forward_to_log(message: discord.Message):
-    target = bot.get_channel(LOG_TARGET_CHANNEL_ID)
-    if target is None:
-        log.warning("Salon de log %s introuvable (cache).", LOG_TARGET_CHANNEL_ID)
-        return
- 
-    embed = discord.Embed(
-        description=message.content or "*(aucun contenu texte)*",
-        color=discord.Color.blurple(),
-        timestamp=message.created_at,
-    )
-    embed.set_author(name=f"{message.author} ({message.author.id})", icon_url=message.author.display_avatar.url)
-    embed.set_footer(text=f"#{message.channel.name}")
- 
-    files = []
-    for attachment in message.attachments:
-        try:
-            files.append(await attachment.to_file())
-        except discord.HTTPException as e:
-            log.warning("Impossible de récupérer la pièce jointe %s : %s", attachment.filename, e)
- 
-    try:
-        await target.send(embed=embed, files=files or None)
-    except discord.Forbidden:
-        log.warning("Permissions manquantes pour écrire dans le salon de log %s", LOG_TARGET_CHANNEL_ID)
-    except discord.HTTPException as e:
-        log.warning("Échec de l'envoi du log : %s", e)
-
-# ---------------------------------------------------------------------------
-# Listens to every message to trigger the sticky repost
-# ---------------------------------------------------------------------------
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.id == bot.user.id or message.guild is None:
-        return
-
-    if message.channel.id == LOG_SOURCE_CHANNEL_ID:
-        await forward_to_log(message)
-
-    cfg = await bot.db.get_sticky(message.channel.id)
-    if not cfg:
-        return
-
-    counter = await bot.db.increment_counter(message.channel.id)
-    if counter < cfg["threshold"]:
-        return
-
-    # Threshold reached: delete the old sticky and send a new one
-    if cfg["last_message_id"]:
-        try:
-            old = await message.channel.fetch_message(cfg["last_message_id"])
-            await old.delete()
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass
-
-    try:
-        new_msg = await message.channel.send(cfg["text"])
-        await bot.db.reset_counter_and_message(message.channel.id, new_msg.id)
-    except discord.Forbidden:
-        log.warning("Missing permissions in %s", message.channel.id)
+            log.info("Reprise du giveaway %s (fin prévue à %s)", row["message_id"], row["end_ts"])
+            asyncio.create_task(
+                run_giveaway(
+                    channel=channel,
+                    message=message,
+                    prize=row["prize"],
+                    winners_count=row["winners"],
+                    end_ts=row["end_ts"],
+                    color=discord.Color(row["color"]),
+                    host=host,
+                    db=self.db,
+                )
+            )
 
 
-# ---------------------------------------------------------------------------
-# Slash commands
-# ---------------------------------------------------------------------------
-@bot.tree.command(name="stick", description="Stick a message for this channel")
-@app_commands.describe(
-    text="Message content",
-    threshold="Number of messages before repost (default 1)",
-)
-@app_commands.default_permissions(manage_messages=True)
-async def stick(interaction: discord.Interaction, text: str, threshold: app_commands.Range[int, 1, 50] = DEFAULT_THRESHOLD):
-    perms = interaction.channel.permissions_for(interaction.guild.me)
-    if not (perms.send_messages and perms.manage_messages):
-        await interaction.response.send_message(
-            "❌ Missing permissions: **Send messages** and **Manage messages** in this channel.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    msg = await interaction.channel.send(text)
-    await bot.db.set_sticky(interaction.channel.id, interaction.guild_id, text, threshold, msg.id)
-    await interaction.followup.send(
-        f"📌 Sticky enabled in {interaction.channel.mention} (repost every {threshold} messages).",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="stickstop", description="Disable the sticky post in this channel")
-@app_commands.default_permissions(manage_messages=True)
-async def stickstop(interaction: discord.Interaction):
-    cfg = await bot.db.remove_sticky(interaction.channel.id)
-    if not cfg:
-        await interaction.response.send_message("There is no active sticky message in this channel.", ephemeral=True)
-        return
-
-    if cfg["last_message_id"]:
-        try:
-            old = await interaction.channel.fetch_message(cfg["last_message_id"])
-            await old.delete()
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass
-
-    await interaction.response.send_message("🛑 Sticky disabled for this channel.", ephemeral=True)
-
-
-@bot.tree.command(name="stickstatus", description="View the sticky post settings for this channel")
-async def stickstatus(interaction: discord.Interaction):
-    cfg = await bot.db.get_sticky(interaction.channel.id)
-    if not cfg:
-        await interaction.response.send_message("There is no active sticky message in this channel.", ephemeral=True)
-        return
-
-    embed = discord.Embed(title="📌 Active Sticky", color=discord.Color.blurple())
-    embed.add_field(name="Text", value=cfg["text"][:1000], inline=False)
-    embed.add_field(name="Repost Threshold", value=f"{cfg['threshold']} messages", inline=True)
-    embed.add_field(name="Current Counter", value=f"{cfg['counter']}/{cfg['threshold']}", inline=True)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+bot = GivewayBot()
 
 
 # --- People/role allowed to change the bot's name/avatar ---
@@ -238,12 +151,16 @@ _role_env = os.getenv("BOT_ADMIN_ROLE_ID", "").strip()
 BOT_ADMIN_ROLE_ID = int(_role_env) if _role_env.isdigit() else None
 
 
-def is_bot_admin(member: discord.Member) -> bool:
-    """Checks whether this member is allowed to change the bot's name/avatar."""
+def is_admin(member: discord.Member) -> bool:
+    """Vérifie si le membre est autorisé (via le .env ou permissions du serveur)."""
+    # 1. Vérifie si l'utilisateur est dans la liste ADMINS du .env
     if member.id in BOT_ADMIN_IDS:
         return True
-    if BOT_ADMIN_ROLE_ID is not None:
-        return any(role.id == BOT_ADMIN_ROLE_ID for role in member.roles)
+    
+    # 2. Vérifie si l'utilisateur est un administrateur sur le serveur Discord
+    if hasattr(member, "guild_permissions") and member.guild_permissions.manage_guild:
+        return True
+        
     return False
 
 
@@ -279,7 +196,7 @@ async def bot_config(
     activity_type: app_commands.Choice[str] = None,
     activity_text: str = None,
 ):
-    if not is_bot_admin(interaction.user):
+    if not is_admin(interaction.user):
         await interaction.response.send_message(
             "❌ You don't have permission to use this command.", ephemeral=True
         )
@@ -341,6 +258,220 @@ async def bot_config(
             changes.append(f"activity → **{activity_text}**")
 
     await interaction.followup.send("✅ " + " and ".join(changes), ephemeral=True)
+
+
+# --- Giveaways ---
+
+GIVEAWAY_EMOJI = "🎉"
+
+DURATION_UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+DURATION_RE = re.compile(r"(\d+)\s*([dhms])", re.IGNORECASE)
+
+COLOR_NAMES = {
+    "red": discord.Color.red(),
+    "dark_red": discord.Color.dark_red(),
+    "green": discord.Color.green(),
+    "dark_green": discord.Color.dark_green(),
+    "blue": discord.Color.blue(),
+    "dark_blue": discord.Color.dark_blue(),
+    "blurple": discord.Color.blurple(),
+    "gold": discord.Color.gold(),
+    "orange": discord.Color.orange(),
+    "purple": discord.Color.purple(),
+    "dark_purple": discord.Color.dark_purple(),
+    "magenta": discord.Color.magenta(),
+    "teal": discord.Color.teal(),
+    "dark_teal": discord.Color.dark_teal(),
+    "yellow": discord.Color.from_rgb(255, 221, 0),
+    "pink": discord.Color.from_rgb(255, 105, 180),
+    "black": discord.Color.from_rgb(0, 0, 0),
+    "white": discord.Color.from_rgb(255, 255, 255),
+    "grey": discord.Color.greyple(),
+    "gray": discord.Color.greyple(),
+}
+
+
+def parse_duration(duration_str: str) -> int:
+    """Parses a duration like '10m', '2h', '1d12h' into a number of seconds."""
+    matches = DURATION_RE.findall(duration_str.strip())
+    if not matches:
+        raise ValueError(
+            "Invalid duration. Use a combination of d/h/m/s, e.g. `30m`, `2h`, `1d12h`."
+        )
+    seconds = sum(int(value) * DURATION_UNIT_SECONDS[unit.lower()] for value, unit in matches)
+    if seconds <= 0:
+        raise ValueError("Duration must be greater than 0.")
+    if seconds > 30 * 86400:
+        raise ValueError("Duration is too long (max 30 days).")
+    return seconds
+
+
+def parse_color(color_str: Optional[str]) -> discord.Color:
+    """Parses a color name or hex code into a discord.Color. Defaults to blurple."""
+    if not color_str or not color_str.strip():
+        return discord.Color.blurple()
+    key = color_str.strip().lower().replace(" ", "_")
+    if key in COLOR_NAMES:
+        return COLOR_NAMES[key]
+    hex_str = key.lstrip("#")
+    if re.fullmatch(r"[0-9a-f]{6}", hex_str):
+        return discord.Color(int(hex_str, 16))
+    if re.fullmatch(r"[0-9a-f]{3}", hex_str):
+        hex_str = "".join(c * 2 for c in hex_str)
+        return discord.Color(int(hex_str, 16))
+    raise ValueError(
+        f"Unrecognized color `{color_str}`. Use a name (e.g. `red`, `blurple`, `gold`) "
+        "or a hex code (e.g. `#ff5733`)."
+    )
+
+
+def build_giveaway_embed(
+    prize: str,
+    winners: int,
+    end_ts: int,
+    color: discord.Color,
+    host: discord.abc.User,
+    ended: bool = False,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="🎉 A giveaway is in progress! 🎉" if not ended else "🎉 Giveaway ended 🎉",
+        description=prize,
+        color=color if not ended else discord.Color.greyple(),
+    )
+    embed.add_field(name="Winners", value=str(winners), inline=True)
+    if ended:
+        embed.add_field(name="Ended", value=f"<t:{end_ts}:R>", inline=True)
+    else:
+        embed.add_field(name="Time remaining", value=f"<t:{end_ts}:R>", inline=True)
+        embed.set_footer(text=f"React with {GIVEAWAY_EMOJI} to enter! • Hosted by {host.display_name}")
+    return embed
+
+
+async def run_giveaway(
+    channel: discord.abc.Messageable,
+    message: discord.Message,
+    prize: str,
+    winners_count: int,
+    end_ts: int,
+    color: discord.Color,
+    host: discord.abc.User,
+    db: Database,
+):
+    """Waits until end_ts, then picks winners among the people who reacted."""
+    remaining = end_ts - int(time.time())
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
+    final_ts = int(time.time())
+
+    try:
+        message = await channel.fetch_message(message.id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        log.warning("Giveaway message %s could not be fetched at draw time.", message.id)
+        await db.remove_giveaway(message.id)
+        return
+
+    entrants = []
+    for reaction in message.reactions:
+        if str(reaction.emoji) == GIVEAWAY_EMOJI:
+            async for user in reaction.users():
+                if not user.bot and user.id not in {u.id for u in entrants}:
+                    entrants.append(user)
+            break
+
+    ended_embed = build_giveaway_embed(prize, winners_count, final_ts, color, host, ended=True)
+
+    if not entrants:
+        ended_embed.add_field(name="Result", value="No valid entries — no winner could be drawn.", inline=False)
+        try:
+            await message.edit(embed=ended_embed)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+        await channel.send(f"🎉 The giveaway for **{prize}** ended, but nobody entered. No winner this time!")
+        await db.remove_giveaway(message.id)
+        return
+
+    chosen = random.sample(entrants, k=min(winners_count, len(entrants)))
+    mentions = ", ".join(winner.mention for winner in chosen)
+
+    ended_embed.add_field(name="Winner(s)", value=mentions, inline=False)
+    try:
+        await message.edit(embed=ended_embed)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+    congrats_embed = discord.Embed(
+        title="🎉 Congratulations! 🎉",
+        description=f"{mentions} — you won **{prize}**!",
+        color=discord.Color.gold(),
+    )
+    congrats_embed.set_footer(text=f"Hosted by {host.display_name}")
+    await channel.send(content=mentions, embed=congrats_embed)
+    await db.remove_giveaway(message.id)
+
+
+@bot.tree.command(name="giveaway", description="Start a giveaway")
+@app_commands.describe(
+    duration="How long the giveaway runs, e.g. 30m, 2h, 1d12h",
+    prize="The text to display for the giveaway (what's being won)",
+    winners="Number of winners to draw",
+    color="Embed color: a name (red, blue, gold, blurple...) or hex code (#ff5733). Optional.",
+)
+
+async def giveaway(
+    interaction: discord.Interaction,
+    duration: str,
+    prize: str,
+    winners: app_commands.Range[int, 1, 50],
+    color: Optional[str] = None,
+):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message(
+            "❌ You don't have permission to create giveaways.", ephemeral=True
+        )
+        return
+    try:
+        duration_seconds = parse_duration(duration)
+    except ValueError as e:
+        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+        return
+
+    try:
+        embed_color = parse_color(color)
+    except ValueError as e:
+        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+        return
+
+    end_ts = int(time.time()) + duration_seconds
+    embed = build_giveaway_embed(prize, winners, end_ts, embed_color, interaction.user)
+
+    await interaction.response.send_message(embed=embed)
+    message = await interaction.original_response()
+    await message.add_reaction(GIVEAWAY_EMOJI)
+
+    await bot.db.add_giveaway(
+        message_id=message.id,
+        channel_id=interaction.channel.id,
+        guild_id=interaction.guild.id if interaction.guild else None,
+        host_id=interaction.user.id,
+        prize=prize,
+        winners=winners,
+        color=embed_color.value,
+        end_ts=end_ts,
+    )
+
+    asyncio.create_task(
+        run_giveaway(
+            channel=interaction.channel,
+            message=message,
+            prize=prize,
+            winners_count=winners,
+            end_ts=end_ts,
+            color=embed_color,
+            host=interaction.user,
+            db=bot.db,
+        )
+    )
 
 
 async def main():
