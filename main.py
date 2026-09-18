@@ -32,6 +32,7 @@ DATA_DIR = os.getenv("DATA_DIR", "/data")
 DEFAULT_THRESHOLD = int(os.getenv("DEFAULT_THRESHOLD", "1"))
 
 INTENTS = discord.Intents.default()
+INTENTS.message_content = True
 
 ACTIVITY_TYPES = {
     "playing": discord.ActivityType.playing,
