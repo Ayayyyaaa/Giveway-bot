@@ -1,0 +1,13 @@
+services:
+  autem1:
+    build: .
+    container_name: autem1
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # En local / test : ./data suffit.
+      # Sur TrueNAS Scale : remplace par le chemin ABSOLU de ton dataset
+      # persistant, ex : /mnt/tank/apps/stampede-bot-data:/app/data
+      # -> sinon les données ne survivent pas à une recréation du conteneur.
+      - /mnt/tank/apps/autem1-data:/app/data

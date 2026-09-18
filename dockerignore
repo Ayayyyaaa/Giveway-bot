@@ -1,0 +1,38 @@
+# Secrets - ne jamais copier le token dans l'image
+.env
+.env.*
+!.env.example
+
+# Données persistantes (montées en volume, pas besoin dans l'image)
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+venv/
+.venv/
+
+# Git / éditeurs / OS
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Divers
+README.md
+*.log
