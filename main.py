@@ -318,6 +318,7 @@ GIVEAWAY_EMOJI = "🎉"
 
 DURATION_UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 DURATION_RE = re.compile(r"(\d+)\s*([dhms])", re.IGNORECASE)
+DURATION_FULL_RE = re.compile(r"^\s*(?:\d+\s*[dhms]\s*)+$", re.IGNORECASE)
 
 COLOR_NAMES = {
     "red": discord.Color.red(),
@@ -345,7 +346,11 @@ COLOR_NAMES = {
 
 def parse_duration(duration_str: str) -> int:
     """Parses a duration like '10m', '2h', '1d12h' into a number of seconds."""
-    matches = DURATION_RE.findall(duration_str.strip())
+    if not DURATION_FULL_RE.match(duration_str):
+        raise ValueError(
+            "Invalid duration. Use a combination of d/h/m/s, e.g. `30m`, `2h`, `1d12h`."
+        )
+    matches = DURATION_RE.findall(duration_str)
     if not matches:
         raise ValueError(
             "Invalid duration. Use a combination of d/h/m/s, e.g. `30m`, `2h`, `1d12h`."
@@ -472,7 +477,7 @@ async def run_giveaway(
 
     congrats_embed = discord.Embed(
         title="🎉 Congratulations! 🎉",
-        description=f"{mentions} — you won **{reward_label}**!",
+        description=f"{mentions} - you won **{reward_label}**!",
         color=discord.Color.gold(),
     )
     if picture_url:
@@ -583,35 +588,42 @@ async def giveaway(
 
 # --- Auto-responder ---
 
-@bot.tree.command(name="respond", description="Create or update an auto-responder trigger word")
+@bot.tree.command(name="respond", description="Create or update a trigger word auto-responder")
 @app_commands.describe(
     word="Trigger word (matched as a whole word in messages, case-insensitive)",
-    response="What the bot replies when the word is mentioned",
-    reaction="Emoji the bot reacts with on the triggering message (optional)",
-    cooldown="Minimum time between triggers for this word, e.g. 30s, 1m, 1h (optional, default: no cooldown)",
+    response="What the bot replies when the word is mentioned (optional if you set a reaction)",
+    reaction="Emoji the bot reacts with on the triggering message (optional if you set a response)",
+    cooldown="Minimum time between triggers, e.g. 30s, 1m, 1h, 1d (optional, default: no cooldown)",
 )
+@app_commands.default_permissions(manage_messages=True)
 async def respond(
     interaction: discord.Interaction,
     word: str,
-    response: str,
+    response: Optional[str] = None,
     reaction: Optional[str] = None,
     cooldown: Optional[str] = None,
 ):
     if not is_admin(interaction.user):
         await interaction.response.send_message(
-            "❌ You don't have permission to manage auto-responders.", ephemeral=True
+            "❌ You don't have permission to manage trigger words.", ephemeral=True
         )
         return
-
-    if not interaction.guild:
-        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
-        return
-
+ 
     word_clean = word.strip()
     if not word_clean:
         await interaction.response.send_message("❌ The trigger word can't be empty.", ephemeral=True)
         return
-
+ 
+    # At least one of response / reaction is required. An empty response is stored
+    # as "" (the DB column is NOT NULL) and is skipped by check_triggers.
+    response = (response or "").strip()
+    reaction = (reaction or "").strip() or None
+    if not response and not reaction:
+        await interaction.response.send_message(
+            "❌ Give at least a `response` or a `reaction` (or both).", ephemeral=True
+        )
+        return
+ 
     cooldown_seconds = 0
     if cooldown:
         try:
@@ -619,28 +631,32 @@ async def respond(
         except ValueError as e:
             await interaction.response.send_message(f"❌ {e}", ephemeral=True)
             return
-
-    await bot.db.upsert_trigger(interaction.guild.id, word_clean, response, reaction, cooldown_seconds)
-    bot.trigger_cache.setdefault(interaction.guild.id, {})[word_clean.lower()] = {
+ 
+    await bot.db.upsert_trigger(interaction.guild_id, word_clean, response, reaction, cooldown_seconds)
+    bot.trigger_cache.setdefault(interaction.guild_id, {})[word_clean.lower()] = {
         "response": response,
         "reaction": reaction,
         "cooldown_seconds": cooldown_seconds,
     }
-
+ 
     cooldown_desc = f"{cooldown_seconds}s cooldown" if cooldown_seconds else "no cooldown"
+    if response and reaction:
+        action_desc = "message + reaction"
+    elif response:
+        action_desc = "message only"
+    else:
+        action_desc = "reaction only"
     await interaction.response.send_message(
-        f"✅ Trigger `{word_clean}` saved ({cooldown_desc}).", ephemeral=True
+        f"✅ Trigger `{word_clean}` saved ({action_desc}, {cooldown_desc}).", ephemeral=True
     )
-
+ 
     if reaction:
-        # Try reacting to our own confirmation message just to validate the emoji is usable;
-        # if it fails, the trigger is still saved but won't be able to react when it fires.
         try:
             confirmation = await interaction.original_response()
             await confirmation.add_reaction(reaction)
         except discord.HTTPException:
             await interaction.followup.send(
-                f"I couldn't react with `{reaction}` - make sure it's a valid emoji I have access to "
+                f"⚠️ I couldn't react with `{reaction}` — make sure it's a valid emoji I have access to "
                 "(the trigger was still saved, but the reaction may not work).",
                 ephemeral=True,
             )
