@@ -1,11 +1,5 @@
-"""Discord bot: a "sticky" message that always stays at the bottom of the channel.
-
-Principle: every time a member posts a new message in a channel with an
-active sticky, a counter is incremented. Once the threshold is reached, the
-old sticky message is deleted and a new one is sent (so it's always at the
-bottom of the conversation), then the counter is reset to 0.
-"""
 import asyncio
+import io
 import logging
 import os
 import random
@@ -64,9 +58,16 @@ class GivewayBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=INTENTS)
         self.db = Database()
+        # In-memory cache of auto-responder triggers, kept in sync with the DB so
+        # on_message doesn't need a database round-trip for every single message.
+        # Shape: {guild_id: {word_lowercase: {"response": str, "reaction": str|None, "cooldown_seconds": int}}}
+        self.trigger_cache: dict[int, dict[str, dict]] = {}
+        # Last time (time.time()) each (guild_id, word) trigger fired, for cooldown checks.
+        self.trigger_last_fired: dict[tuple[int, str], float] = {}
 
     async def setup_hook(self):
         await self.db.connect()
+        await self.load_triggers()
 
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
@@ -135,8 +136,58 @@ class GivewayBot(commands.Bot):
                     color=discord.Color(row["color"]),
                     host=host,
                     db=self.db,
+                    reward=row.get("reward"),
+                    banner_url=row.get("banner_url"),
+                    picture_url=row.get("picture_url"),
                 )
             )
+
+    async def load_triggers(self):
+        """Loads every auto-responder trigger from the DB into the in-memory cache."""
+        self.trigger_cache.clear()
+        rows = await self.db.get_triggers()
+        for row in rows:
+            self.trigger_cache.setdefault(row["guild_id"], {})[row["word"]] = {
+                "response": row["response"],
+                "reaction": row["reaction"],
+                "cooldown_seconds": row["cooldown_seconds"],
+            }
+        log.info("Loaded %d auto-responder trigger(s) from the database.", len(rows))
+
+    async def on_message(self, message: discord.Message):
+        # Let discord.ext.commands still process the "!" prefix commands, if any are added later.
+        await self.process_commands(message)
+
+        if message.author.bot or not message.guild:
+            return
+
+        triggers = self.trigger_cache.get(message.guild.id)
+        if not triggers:
+            return
+
+        content_lower = message.content.lower()
+        now = time.time()
+
+        for word, cfg in triggers.items():
+            if not re.search(rf"\b{re.escape(word)}\b", content_lower):
+                continue
+
+            key = (message.guild.id, word)
+            last_fired = self.trigger_last_fired.get(key, 0.0)
+            if now - last_fired < cfg["cooldown_seconds"]:
+                continue  # still on cooldown, skip silently
+            self.trigger_last_fired[key] = now
+
+            if cfg["response"]:
+                try:
+                    await message.channel.send(cfg["response"])
+                except discord.HTTPException:
+                    log.warning("Failed to send auto-responder message for trigger '%s'.", word)
+            if cfg["reaction"]:
+                try:
+                    await message.add_reaction(cfg["reaction"])
+                except discord.HTTPException:
+                    log.warning("Failed to add reaction '%s' for trigger '%s'.", cfg["reaction"], word)
 
 
 bot = GivewayBot()
@@ -332,6 +383,9 @@ def build_giveaway_embed(
     end_ts: int,
     color: discord.Color,
     host: discord.abc.User,
+    reward: Optional[str] = None,
+    banner_url: Optional[str] = None,
+    picture_url: Optional[str] = None,
     ended: bool = False,
 ) -> discord.Embed:
     embed = discord.Embed(
@@ -339,12 +393,18 @@ def build_giveaway_embed(
         description=prize,
         color=color if not ended else discord.Color.greyple(),
     )
+    if reward:
+        embed.add_field(name="Reward", value=reward, inline=True)
     embed.add_field(name="Winners", value=str(winners), inline=True)
     if ended:
         embed.add_field(name="Ended", value=f"<t:{end_ts}:R>", inline=True)
     else:
         embed.add_field(name="Time remaining", value=f"<t:{end_ts}:R>", inline=True)
         embed.set_footer(text=f"React with {GIVEAWAY_EMOJI} to enter! • Hosted by {host.display_name}")
+    if picture_url:
+        embed.set_thumbnail(url=picture_url)
+    if banner_url:
+        embed.set_image(url=banner_url)
     return embed
 
 
@@ -357,6 +417,9 @@ async def run_giveaway(
     color: discord.Color,
     host: discord.abc.User,
     db: Database,
+    reward: Optional[str] = None,
+    banner_url: Optional[str] = None,
+    picture_url: Optional[str] = None,
 ):
     """Waits until end_ts, then picks winners among the people who reacted."""
     remaining = end_ts - int(time.time())
@@ -364,6 +427,9 @@ async def run_giveaway(
         await asyncio.sleep(remaining)
 
     final_ts = int(time.time())
+    # What to call the prize in the winner announcement, without repeating the full
+    # giveaway text: the short "reward" field if one was set, else the giveaway text itself.
+    reward_label = reward if reward else prize
 
     try:
         message = await channel.fetch_message(message.id)
@@ -380,7 +446,10 @@ async def run_giveaway(
                     entrants.append(user)
             break
 
-    ended_embed = build_giveaway_embed(prize, winners_count, final_ts, color, host, ended=True)
+    ended_embed = build_giveaway_embed(
+        prize, winners_count, final_ts, color, host,
+        reward=reward, banner_url=banner_url, picture_url=picture_url, ended=True,
+    )
 
     if not entrants:
         ended_embed.add_field(name="Result", value="No valid entries — no winner could be drawn.", inline=False)
@@ -388,7 +457,7 @@ async def run_giveaway(
             await message.edit(embed=ended_embed)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
-        await channel.send(f"🎉 The giveaway for **{prize}** ended, but nobody entered. No winner this time!")
+        await channel.send(f"🎉 The giveaway for **{reward_label}** ended, but nobody entered. No winner this time!")
         await db.remove_giveaway(message.id)
         return
 
@@ -403,9 +472,11 @@ async def run_giveaway(
 
     congrats_embed = discord.Embed(
         title="🎉 Congratulations! 🎉",
-        description=f"{mentions} — you won **{prize}**!",
+        description=f"{mentions} — you won **{reward_label}**!",
         color=discord.Color.gold(),
     )
+    if picture_url:
+        congrats_embed.set_thumbnail(url=picture_url)
     congrats_embed.set_footer(text=f"Hosted by {host.display_name}")
     await channel.send(content=mentions, embed=congrats_embed)
     await db.remove_giveaway(message.id)
@@ -417,14 +488,20 @@ async def run_giveaway(
     prize="The text to display for the giveaway (what's being won)",
     winners="Number of winners to draw",
     color="Embed color: a name (red, blue, gold, blurple...) or hex code (#ff5733). Optional.",
+    reward="Short reward name shown as its own field and reused in the winner announcement "
+           "(defaults to the prize text above if left empty)",
+    picture="Small image shown in the corner of the embed (optional)",
+    banner="Large banner image shown at the bottom of the embed (optional)",
 )
-
 async def giveaway(
     interaction: discord.Interaction,
     duration: str,
     prize: str,
     winners: app_commands.Range[int, 1, 50],
     color: Optional[str] = None,
+    reward: Optional[str] = None,
+    picture: Optional[discord.Attachment] = None,
+    banner: Optional[discord.Attachment] = None,
 ):
     if not is_admin(interaction.user):
         await interaction.response.send_message(
@@ -443,10 +520,33 @@ async def giveaway(
         await interaction.response.send_message(f"❌ {e}", ephemeral=True)
         return
 
-    end_ts = int(time.time()) + duration_seconds
-    embed = build_giveaway_embed(prize, winners, end_ts, embed_color, interaction.user)
+    for attachment, label in ((picture, "picture"), (banner, "banner")):
+        if attachment and not (attachment.content_type or "").startswith("image/"):
+            await interaction.response.send_message(f"❌ The {label} file is not an image.", ephemeral=True)
+            return
 
-    await interaction.response.send_message(embed=embed)
+    # Re-upload the images as attachments on the giveaway message itself (referenced via
+    # "attachment://filename") instead of using attachment.url, which is an ephemeral
+    # interaction CDN link that can expire before a multi-day giveaway ends.
+    files = []
+    picture_url = None
+    banner_url = None
+    if picture:
+        picture_filename = f"picture_{picture.filename}"
+        files.append(discord.File(io.BytesIO(await picture.read()), filename=picture_filename))
+        picture_url = f"attachment://{picture_filename}"
+    if banner:
+        banner_filename = f"banner_{banner.filename}"
+        files.append(discord.File(io.BytesIO(await banner.read()), filename=banner_filename))
+        banner_url = f"attachment://{banner_filename}"
+
+    end_ts = int(time.time()) + duration_seconds
+    embed = build_giveaway_embed(
+        prize, winners, end_ts, embed_color, interaction.user,
+        reward=reward, banner_url=banner_url, picture_url=picture_url,
+    )
+
+    await interaction.response.send_message(embed=embed, files=files)
     message = await interaction.original_response()
     await message.add_reaction(GIVEAWAY_EMOJI)
 
@@ -459,6 +559,9 @@ async def giveaway(
         winners=winners,
         color=embed_color.value,
         end_ts=end_ts,
+        reward=reward,
+        banner_url=banner_url,
+        picture_url=picture_url,
     )
 
     asyncio.create_task(
@@ -471,8 +574,96 @@ async def giveaway(
             color=embed_color,
             host=interaction.user,
             db=bot.db,
+            reward=reward,
+            banner_url=banner_url,
+            picture_url=picture_url,
         )
     )
+
+
+# --- Auto-responder ---
+
+@bot.tree.command(name="respond", description="Create or update an auto-responder trigger word")
+@app_commands.describe(
+    word="Trigger word (matched as a whole word in messages, case-insensitive)",
+    response="What the bot replies when the word is mentioned",
+    reaction="Emoji the bot reacts with on the triggering message (optional)",
+    cooldown="Minimum time between triggers for this word, e.g. 30s, 1m, 1h (optional, default: no cooldown)",
+)
+async def respond(
+    interaction: discord.Interaction,
+    word: str,
+    response: str,
+    reaction: Optional[str] = None,
+    cooldown: Optional[str] = None,
+):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message(
+            "❌ You don't have permission to manage auto-responders.", ephemeral=True
+        )
+        return
+
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    word_clean = word.strip()
+    if not word_clean:
+        await interaction.response.send_message("❌ The trigger word can't be empty.", ephemeral=True)
+        return
+
+    cooldown_seconds = 0
+    if cooldown:
+        try:
+            cooldown_seconds = parse_duration(cooldown)
+        except ValueError as e:
+            await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+            return
+
+    await bot.db.upsert_trigger(interaction.guild.id, word_clean, response, reaction, cooldown_seconds)
+    bot.trigger_cache.setdefault(interaction.guild.id, {})[word_clean.lower()] = {
+        "response": response,
+        "reaction": reaction,
+        "cooldown_seconds": cooldown_seconds,
+    }
+
+    cooldown_desc = f"{cooldown_seconds}s cooldown" if cooldown_seconds else "no cooldown"
+    await interaction.response.send_message(
+        f"✅ Trigger `{word_clean}` saved ({cooldown_desc}).", ephemeral=True
+    )
+
+    if reaction:
+        # Try reacting to our own confirmation message just to validate the emoji is usable;
+        # if it fails, the trigger is still saved but won't be able to react when it fires.
+        try:
+            confirmation = await interaction.original_response()
+            await confirmation.add_reaction(reaction)
+        except discord.HTTPException:
+            await interaction.followup.send(
+                f"I couldn't react with `{reaction}` - make sure it's a valid emoji I have access to "
+                "(the trigger was still saved, but the reaction may not work).",
+                ephemeral=True,
+            )
+
+
+@bot.tree.command(name="respond-remove", description="Remove an auto-responder trigger word")
+@app_commands.describe(word="The trigger word to remove")
+async def respond_remove(interaction: discord.Interaction, word: str):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message(
+            "❌ You don't have permission to manage auto-responders.", ephemeral=True
+        )
+        return
+
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    word_clean = word.strip().lower()
+    await bot.db.remove_trigger(interaction.guild.id, word_clean)
+    bot.trigger_cache.get(interaction.guild.id, {}).pop(word_clean, None)
+
+    await interaction.response.send_message(f"Trigger `{word_clean}` removed (if it existed).", ephemeral=True)
 
 
 async def main():

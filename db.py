@@ -48,10 +48,37 @@ class Database:
                 prize TEXT NOT NULL,
                 winners INTEGER NOT NULL,
                 color INTEGER NOT NULL,
-                end_ts INTEGER NOT NULL
+                end_ts INTEGER NOT NULL,
+                reward TEXT,
+                banner_url TEXT,
+                picture_url TEXT
             )
             """
         )
+        await self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS triggers (
+                guild_id INTEGER NOT NULL,
+                word TEXT NOT NULL,
+                response TEXT NOT NULL,
+                reaction TEXT,
+                cooldown_seconds INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, word)
+            )
+            """
+        )
+        # Migration: add new giveaway columns if this DB was created before they existed.
+        # SQLite's ADD COLUMN is a no-op-safe operation we guard with a try/except
+        # so existing deployments keep their data instead of needing a manual fix.
+        for column, ddl in (
+            ("reward", "ALTER TABLE giveaways ADD COLUMN reward TEXT"),
+            ("banner_url", "ALTER TABLE giveaways ADD COLUMN banner_url TEXT"),
+            ("picture_url", "ALTER TABLE giveaways ADD COLUMN picture_url TEXT"),
+        ):
+            try:
+                await self._conn.execute(ddl)
+            except aiosqlite.OperationalError:
+                pass  # column already exists
         await self._conn.commit()
 
     # --- Presence ---
@@ -89,14 +116,21 @@ class Database:
         winners: int,
         color: int,
         end_ts: int,
+        reward: str | None = None,
+        banner_url: str | None = None,
+        picture_url: str | None = None,
     ):
         await self._conn.execute(
             """
             INSERT OR REPLACE INTO giveaways
-                (message_id, channel_id, guild_id, host_id, prize, winners, color, end_ts)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (message_id, channel_id, guild_id, host_id, prize, winners, color, end_ts,
+                 reward, banner_url, picture_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (message_id, channel_id, guild_id, host_id, prize, winners, color, end_ts),
+            (
+                message_id, channel_id, guild_id, host_id, prize, winners, color, end_ts,
+                reward, banner_url, picture_url,
+            ),
         )
         await self._conn.commit()
 
@@ -106,7 +140,54 @@ class Database:
 
     async def get_active_giveaways(self):
         async with self._conn.execute(
-            "SELECT message_id, channel_id, guild_id, host_id, prize, winners, color, end_ts FROM giveaways"
+            """
+            SELECT message_id, channel_id, guild_id, host_id, prize, winners, color, end_ts,
+                   reward, banner_url, picture_url
+            FROM giveaways
+            """
         ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    # --- Triggers (auto-responder) ---
+
+    async def upsert_trigger(
+        self,
+        guild_id: int,
+        word: str,
+        response: str,
+        reaction: str | None,
+        cooldown_seconds: int,
+    ):
+        await self._conn.execute(
+            """
+            INSERT INTO triggers (guild_id, word, response, reaction, cooldown_seconds)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, word) DO UPDATE SET
+                response = excluded.response,
+                reaction = excluded.reaction,
+                cooldown_seconds = excluded.cooldown_seconds
+            """,
+            (guild_id, word.lower(), response, reaction, cooldown_seconds),
+        )
+        await self._conn.commit()
+
+    async def remove_trigger(self, guild_id: int, word: str):
+        await self._conn.execute(
+            "DELETE FROM triggers WHERE guild_id = ? AND word = ?", (guild_id, word.lower())
+        )
+        await self._conn.commit()
+
+    async def get_triggers(self, guild_id: int | None = None):
+        if guild_id is None:
+            query = "SELECT guild_id, word, response, reaction, cooldown_seconds FROM triggers"
+            params = ()
+        else:
+            query = (
+                "SELECT guild_id, word, response, reaction, cooldown_seconds "
+                "FROM triggers WHERE guild_id = ?"
+            )
+            params = (guild_id,)
+        async with self._conn.execute(query, params) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
