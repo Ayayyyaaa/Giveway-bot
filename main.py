@@ -523,7 +523,7 @@ async def giveaway(
 ):
     if not is_admin(interaction.user):
         await interaction.response.send_message(
-            "❌ You don't have permission to create giveaways.", ephemeral=True
+            "❌ You don't have permissions.", ephemeral=True
         )
         return
     try:
@@ -608,7 +608,6 @@ async def giveaway(
     reaction="Emoji the bot reacts with on the triggering message (optional if you set a response)",
     cooldown="Minimum time between triggers, e.g. 30s, 1m, 1h, 1d (optional, default: no cooldown)",
 )
-@app_commands.default_permissions(manage_messages=True)
 async def respond(
     interaction: discord.Interaction,
     word: str,
@@ -696,7 +695,6 @@ async def respond_remove(interaction: discord.Interaction, word: str):
 
 
 @bot.tree.command(name="history", description="List all configured trigger word auto-responders for this server")
-@app_commands.default_permissions(manage_messages=True)
 async def history(interaction: discord.Interaction):
     if not is_admin(interaction.user):
         await interaction.response.send_message(
