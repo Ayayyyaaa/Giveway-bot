@@ -363,6 +363,19 @@ def parse_duration(duration_str: str) -> int:
     return seconds
 
 
+def format_duration(seconds: int) -> str:
+    """Formate un nombre de secondes en '1d12h', '30m', etc."""
+    if not seconds:
+        return "no cooldown"
+    parts = []
+    remaining = seconds
+    for unit, unit_seconds in (("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
+        value, remaining = divmod(remaining, unit_seconds)
+        if value:
+            parts.append(f"{value}{unit}")
+    return "".join(parts)
+
+
 def parse_color(color_str: Optional[str]) -> discord.Color:
     """Parses a color name or hex code into a discord.Color. Defaults to blurple."""
     if not color_str or not color_str.strip():
@@ -680,6 +693,50 @@ async def respond_remove(interaction: discord.Interaction, word: str):
     bot.trigger_cache.get(interaction.guild.id, {}).pop(word_clean, None)
 
     await interaction.response.send_message(f"Trigger `{word_clean}` removed (if it existed).", ephemeral=True)
+
+
+@bot.tree.command(name="history", description="List all configured trigger word auto-responders for this server")
+@app_commands.default_permissions(manage_messages=True)
+async def history(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message(
+            "❌ You don't have permission to view trigger history.", ephemeral=True
+        )
+        return
+
+    if not interaction.guild:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    triggers = await bot.db.get_triggers(interaction.guild.id)
+
+    if not triggers:
+        await interaction.response.send_message("No trigger words configured on this server.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="Trigger Word History",
+        description=f"{len(triggers)} trigger{'s' if len(triggers) != 1 else ''} configured on this server.",
+        color=discord.Color.blurple(),
+    )
+
+    for row in sorted(triggers, key=lambda r: r["word"]):
+        response = (row["response"] or "").strip()
+        reaction = row["reaction"]
+
+        if response and reaction:
+            action = f"_Responce_ : {response}\n_Reaction_ : {reaction}"
+        elif response:
+            action = f"_Responce_ : {response}"
+        elif reaction:
+            action = f"_Reaction_ : {reaction}"
+        else:
+            action = "*(nothing configured)*"
+
+        cooldown = format_duration(row["cooldown_seconds"])
+        embed.add_field(name=f"**{row['word']}**", value=f"{action}\n_Cooldown_ : {cooldown}", inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def main():
