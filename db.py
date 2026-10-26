@@ -51,7 +51,8 @@ class Database:
                 end_ts INTEGER NOT NULL,
                 reward TEXT,
                 banner_url TEXT,
-                picture_url TEXT
+                picture_url TEXT,
+                forced_winner_id INTEGER
             )
             """
         )
@@ -74,6 +75,7 @@ class Database:
             ("reward", "ALTER TABLE giveaways ADD COLUMN reward TEXT"),
             ("banner_url", "ALTER TABLE giveaways ADD COLUMN banner_url TEXT"),
             ("picture_url", "ALTER TABLE giveaways ADD COLUMN picture_url TEXT"),
+            ("forced_winner_id", "ALTER TABLE giveaways ADD COLUMN forced_winner_id INTEGER"),
         ):
             try:
                 await self._conn.execute(ddl)
@@ -119,17 +121,18 @@ class Database:
         reward: str | None = None,
         banner_url: str | None = None,
         picture_url: str | None = None,
+        forced_winner_id: int | None = None,
     ):
         await self._conn.execute(
             """
             INSERT OR REPLACE INTO giveaways
                 (message_id, channel_id, guild_id, host_id, prize, winners, color, end_ts,
-                 reward, banner_url, picture_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 reward, banner_url, picture_url, forced_winner_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 message_id, channel_id, guild_id, host_id, prize, winners, color, end_ts,
-                reward, banner_url, picture_url,
+                reward, banner_url, picture_url, forced_winner_id,
             ),
         )
         await self._conn.commit()
@@ -142,7 +145,7 @@ class Database:
         async with self._conn.execute(
             """
             SELECT message_id, channel_id, guild_id, host_id, prize, winners, color, end_ts,
-                   reward, banner_url, picture_url
+                   reward, banner_url, picture_url, forced_winner_id
             FROM giveaways
             """
         ) as cursor:

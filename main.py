@@ -139,6 +139,7 @@ class GivewayBot(commands.Bot):
                     reward=row.get("reward"),
                     banner_url=row.get("banner_url"),
                     picture_url=row.get("picture_url"),
+                    forced_winner_id=row.get("forced_winner_id"),
                 )
             )
 
@@ -438,6 +439,7 @@ async def run_giveaway(
     reward: Optional[str] = None,
     banner_url: Optional[str] = None,
     picture_url: Optional[str] = None,
+    forced_winner_id: Optional[int] = None,
 ):
     """Waits until end_ts, then picks winners among the people who reacted."""
     remaining = end_ts - int(time.time())
@@ -464,12 +466,25 @@ async def run_giveaway(
                     entrants.append(user)
             break
 
+    # Pre-selected winner (optional). If the member can't be found on the server,
+    # we silently fall back to a fully random draw.
+    forced = None
+    if forced_winner_id:
+        guild = getattr(channel, "guild", None)
+        if guild:
+            forced = guild.get_member(forced_winner_id)
+            if forced is None:
+                try:
+                    forced = await guild.fetch_member(forced_winner_id)
+                except (discord.NotFound, discord.HTTPException):
+                    forced = None
+
     ended_embed = build_giveaway_embed(
         prize, winners_count, final_ts, color, host,
         reward=reward, banner_url=banner_url, picture_url=picture_url, ended=True,
     )
 
-    if not entrants:
+    if not entrants and not forced:
         ended_embed.add_field(name="Result", value="No valid entries — no winner could be drawn.", inline=False)
         try:
             await message.edit(embed=ended_embed)
@@ -479,7 +494,13 @@ async def run_giveaway(
         await db.remove_giveaway(message.id)
         return
 
-    chosen = random.sample(entrants, k=min(winners_count, len(entrants)))
+    if forced:
+        pool = [u for u in entrants if u.id != forced.id]
+        others = random.sample(pool, k=min(max(winners_count - 1, 0), len(pool)))
+        chosen = [forced] + others
+        random.shuffle(chosen)  # so the pre-selected winner isn't always listed first
+    else:
+        chosen = random.sample(entrants, k=min(winners_count, len(entrants)))
     mentions = ", ".join(winner.mention for winner in chosen)
 
     ended_embed.add_field(name="Winner(s)", value=mentions, inline=False)
@@ -559,6 +580,7 @@ async def giveaway(
         banner_url = f"attachment://{banner_filename}"
 
     end_ts = int(time.time()) + duration_seconds
+    forced_winner_id = None
     embed = build_giveaway_embed(
         prize, winners, end_ts, embed_color, interaction.user,
         reward=reward, banner_url=banner_url, picture_url=picture_url,
@@ -580,6 +602,7 @@ async def giveaway(
         reward=reward,
         banner_url=banner_url,
         picture_url=picture_url,
+        forced_winner_id=forced_winner_id,
     )
 
     asyncio.create_task(
@@ -595,6 +618,7 @@ async def giveaway(
             reward=reward,
             banner_url=banner_url,
             picture_url=picture_url,
+            forced_winner_id=forced_winner_id,
         )
     )
 
