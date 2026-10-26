@@ -152,6 +152,13 @@ class Database:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
+    async def get_forced_winner(self, message_id: int):
+        async with self._conn.execute(
+            "SELECT forced_winner_id FROM giveaways WHERE message_id = ?", (message_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row["forced_winner_id"] if row else None
+
     # --- Triggers (auto-responder) ---
 
     async def upsert_trigger(

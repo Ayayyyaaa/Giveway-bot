@@ -468,6 +468,9 @@ async def run_giveaway(
 
     # Pre-selected winner (optional). If the member can't be found on the server,
     # we silently fall back to a fully random draw.
+    db_forced = await db.get_forced_winner(message.id)
+    if db_forced:
+        forced_winner_id = db_forced
     forced = None
     if forced_winner_id:
         guild = getattr(channel, "guild", None)
